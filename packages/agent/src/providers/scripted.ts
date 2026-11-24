@@ -125,10 +125,11 @@ export class ScriptedProvider {
     onTextDelta?: (t: string) => void;
   }) {
     // Check for steering intervention in messages
-    if (this.activeScript.steeringBranches) {
+    const steeringBranches = this.activeScript.steeringBranches;
+    if (steeringBranches) {
       for (const msg of req.messages) {
         if (msg.role === 'user' && typeof msg.content === 'string') {
-          for (const [trigger, branch] of Object.entries(this.activeScript.steeringBranches)) {
+          for (const [trigger, branch] of Object.entries(steeringBranches)) {
             if (msg.content.toLowerCase().includes(trigger.toLowerCase())) {
               this.activeScript = {
                 ...this.activeScript,
