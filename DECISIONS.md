@@ -10,3 +10,4 @@
 | 2026-11-24 | DEC-006 | Claude-inspired UI design system | Warm neutral surfaces, clean typography, monospace tool outputs, accessible focus rings, responsive timeline and graph view | Generic Tailwind templates |
 | 2026-11-24 | DEC-007 | AuthProvider with AUTH_DEV_BYPASS | Enables immediate multi-user local testing (Sara, Ahmed, Lina) with instant user switcher without external Clerk account requirement | Hardcoded auth, mock cookies |
 | 2026-11-24 | DEC-008 | Gapless sequence locking using `FOR UPDATE` on `runs.last_seq` | Guarantees gapless event ordering per run and enforces event immutability via DB trigger | Optimistic concurrency (can produce gaps) |
+| 2026-11-25 | DEC-009 | Fastify `reply.hijack()` for Server-Sent Events | Fastify raw socket control is required to stream chunked SSE lines continuously without waiting for route handler completion | Native node http server, Express |

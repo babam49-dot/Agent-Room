@@ -5,3 +5,4 @@ export * from './policy.js';
 export * from './redactor.js';
 export * from './reducer.js';
 export * from './auth.js';
+export * from './pubsub.js';

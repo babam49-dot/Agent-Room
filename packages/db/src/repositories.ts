@@ -1,4 +1,4 @@
-import { uuidv7 } from '@agentroom/core';
+import { uuidv7, globalPubSub } from '@agentroom/core';
 import type { EventEnvelope, DraftEvent } from '@agentroom/core';
 import { redactPayload } from '@agentroom/core';
 import { createDbPool, createDrizzleClient } from './client.js';
@@ -36,7 +36,11 @@ export class RunRepository {
   constructor(
     private connectionString?: string,
     private publisher?: EventPublisher
-  ) {}
+  ) {
+    if (!this.publisher) {
+      this.publisher = globalPubSub;
+    }
+  }
 
   private async getDrizzle() {
     if (this.isPostgresAvailable === false) return null;
