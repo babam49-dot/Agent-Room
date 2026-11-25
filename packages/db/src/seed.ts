@@ -97,6 +97,31 @@ export async function seedDatabase(connectionString?: string) {
     createdAt: new Date(),
   });
 
+  const defaultInstructions =
+    'Keep backwards compatibility for legacy v1 payloads.\nEnsure all money fields use integer cents (e.g. amountInCents).\nNever touch the internal billing ledger directly.';
+  inMemoryDb.contextBlocks.set('cb-001', {
+    id: 'cb-001',
+    orgId: org.id,
+    runId: run.id,
+    projectId: project.id,
+    kind: 'instructions',
+    title: 'Project Instructions',
+    position: 0,
+    currentVersion: 1,
+    enabled: true,
+    content: defaultInstructions,
+    lockedBy: null,
+    lockExpiresAt: null,
+    createdAt: new Date(),
+  });
+  inMemoryDb.contextVersions.set('cb-001:1', {
+    blockId: 'cb-001',
+    version: 1,
+    content: defaultInstructions,
+    editedBy: users[0]!.id,
+    createdAt: new Date(),
+  });
+
   // Attempt PostgreSQL seed if connected
   try {
     const pool = createDbPool(connectionString);

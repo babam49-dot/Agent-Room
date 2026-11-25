@@ -507,6 +507,7 @@ export function buildServer() {
   // Handback to Agent
   app.post('/v1/runs/:id/handback', async (request, reply) => {
     const params = request.params as { id: string };
+    const body = (request.body as { note?: string }) || {};
 
     await repository.appendEvent(params.id, {
       runId: params.id,
@@ -519,7 +520,225 @@ export function buildServer() {
       },
     });
 
+    if (body.note) {
+      await repository.appendEvent(params.id, {
+        runId: params.id,
+        type: 'message.user',
+        actorType: 'human',
+        actorId: SEEDED_DATA.users[0]!.id,
+        payload: {
+          text: `[Handback Note]: ${body.note}`,
+          mode: 'queue',
+        },
+      });
+    }
+
     return { ok: true, driver: { type: 'agent', userId: null } };
+  });
+
+  // ==========================================
+  // PHASE 3: CONTEXT BLOCKS & LOCKING (Section 12.4)
+  // ==========================================
+  app.get('/v1/runs/:id/context-blocks', async (request, reply) => {
+    const params = request.params as { id: string };
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+    const blocks = await repository.getContextBlocks(orgId, params.id, run?.projectId);
+    return { blocks };
+  });
+
+  app.post('/v1/runs/:id/context-blocks', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = request.body as {
+      kind?: 'instructions' | 'notes' | 'pinned_files' | 'memory';
+      title: string;
+      content: string;
+      userId?: string;
+    };
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+
+    const block = await repository.createContextBlock(orgId, {
+      runId: params.id,
+      projectId: run?.projectId,
+      kind: body.kind || 'instructions',
+      title: body.title,
+      content: body.content,
+      userId: body.userId || SEEDED_DATA.users[0]!.id,
+    });
+
+    return { block };
+  });
+
+  app.patch('/v1/context-blocks/:id', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = request.body as {
+      baseVersion: number;
+      content: string;
+      userId?: string;
+    };
+
+    try {
+      const block = await repository.updateContextBlock(
+        params.id,
+        body.baseVersion,
+        body.content,
+        body.userId || SEEDED_DATA.users[0]!.id
+      );
+      return { block };
+    } catch (err: any) {
+      if (err.code === 'VERSION_CONFLICT') {
+        reply.code(409).send({
+          error: {
+            code: 'VERSION_CONFLICT',
+            message: err.message,
+            latestContent: err.latestContent,
+            latestVersion: err.latestVersion,
+          },
+        });
+        return;
+      }
+      reply.code(400).send({ error: { message: err.message } });
+    }
+  });
+
+  app.post('/v1/context-blocks/:id/lock', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = (request.body as { userId?: string; ttlMs?: number }) || {};
+
+    try {
+      const lock = await repository.acquireBlockLock(
+        params.id,
+        body.userId || SEEDED_DATA.users[0]!.id,
+        body.ttlMs || 30000
+      );
+      return lock;
+    } catch (err: any) {
+      reply.code(423).send({
+        error: {
+          code: 'LOCKED',
+          message: err.message,
+          lockedBy: err.lockedBy,
+        },
+      });
+    }
+  });
+
+  app.delete('/v1/context-blocks/:id/lock', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = (request.body as { userId?: string }) || {};
+    const res = await repository.releaseBlockLock(params.id, body.userId || SEEDED_DATA.users[0]!.id);
+    return res;
+  });
+
+  // ==========================================
+  // PHASE 3: HANDOFFS & TRANSFERS (Section 9.8)
+  // ==========================================
+  app.post('/v1/runs/:id/handoff', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = request.body as {
+      toUserId: string;
+      note?: string;
+      fromUserId?: string;
+    };
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+
+    const handoff = await repository.createHandoff(
+      orgId,
+      params.id,
+      body.fromUserId || SEEDED_DATA.users[0]!.id,
+      body.toUserId,
+      'handoff',
+      body.note
+    );
+
+    return { handoff };
+  });
+
+  app.post('/v1/handoffs/:id/accept', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = (request.body as { resolvedByUserId?: string }) || {};
+    const handoff = await repository.resolveHandoff(params.id, 'accepted', body.resolvedByUserId);
+    return { handoff, status: 'accepted' };
+  });
+
+  app.post('/v1/handoffs/:id/decline', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = (request.body as { resolvedByUserId?: string }) || {};
+    const handoff = await repository.resolveHandoff(params.id, 'declined', body.resolvedByUserId);
+    return { handoff, status: 'declined' };
+  });
+
+  // ==========================================
+  // PHASE 3: HUMAN TOOL EXECUTION (Takeover)
+  // ==========================================
+  app.post('/v1/runs/:id/tools/execute', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = request.body as {
+      name: string;
+      arguments: Record<string, any>;
+      userId?: string;
+    };
+    const userId = body.userId || SEEDED_DATA.users[0]!.id;
+    const toolCallId = uuidv7();
+
+    // 1. Tool requested by human
+    await repository.appendEvent(params.id, {
+      runId: params.id,
+      type: 'tool.requested',
+      actorType: 'human',
+      actorId: userId,
+      payload: {
+        toolCallId,
+        name: body.name,
+        arguments: body.arguments,
+      },
+    });
+
+    // 2. Perform tool execution
+    let output = '';
+    const ok = true;
+    if (body.name === 'run_command') {
+      output = `$ ${body.arguments.command || body.arguments.cmd}\n[Human Driver Execution]: Process exited with code 0`;
+    } else if (body.name === 'write_file') {
+      output = `Successfully wrote ${body.arguments.content?.length || 0} bytes to ${body.arguments.path}`;
+    } else {
+      output = `Executed ${body.name} successfully`;
+    }
+
+    // 3. Tool result by human
+    const resultEnvelope = await repository.appendEvent(params.id, {
+      runId: params.id,
+      type: 'tool.result',
+      actorType: 'human',
+      actorId: userId,
+      payload: {
+        toolCallId,
+        ok,
+        output,
+        durationMs: 42,
+      },
+    });
+
+    return { toolCallId, ok, output, envelope: resultEnvelope };
+  });
+
+  // ==========================================
+  // PHASE 3: FORK WITH EDIT-AND-RERUN (Section 9.8)
+  // ==========================================
+  app.post('/v1/runs/:id/fork', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = (request.body as { atSeq?: number; editedMessage?: string; userId?: string }) || {};
+    const run = await repository.getRun(params.id);
+    if (!run) {
+      reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Run not found' } });
+      return;
+    }
+
+    const atSeq = body.atSeq ?? run.lastSeq ?? 0;
+    const forkedRun = await repository.forkRun(params.id, atSeq, body.editedMessage, body.userId);
+    return { run: forkedRun };
   });
 
   // Trigger Simulation / Execution

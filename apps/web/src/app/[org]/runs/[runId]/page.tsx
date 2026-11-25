@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import { UserSwitcher } from '@/components/UserSwitcher';
 import {
   Bot,
@@ -29,12 +29,18 @@ import {
   ArrowDownCircle,
   Wifi,
   WifiOff,
+  GitBranch,
+  Save,
+  AlertTriangle,
+  ArrowRightLeft,
+  X,
 } from 'lucide-react';
 import { applyEvent, createInitialRunState } from '@agentroom/core';
 import type { EventEnvelope, RunState } from '@agentroom/core';
 
 export default function RunRoomPage() {
   const params = useParams();
+  const router = useRouter();
   const runId = (params?.runId as string) || '01935e40-0004-7000-8000-000000000001';
   const orgSlug = (params?.org as string) || 'acme-engineering';
 
@@ -54,16 +60,49 @@ export default function RunRoomPage() {
   const [messageText, setMessageText] = useState('');
   const [composerMode, setComposerMode] = useState<'queue' | 'interrupt'>('queue');
   const [activeTab, setActiveTab] = useState<'context' | 'files' | 'people' | 'limits'>('context');
-  const [instructions, setInstructions] = useState(
-    'Keep backwards compatibility for legacy v1 payloads.\nEnsure all money fields use integer cents (e.g. amountInCents).\nNever touch the internal billing ledger directly.'
-  );
+
+  // Context Blocks state (Phase 3)
+  const [contextBlocks, setContextBlocks] = useState<any[]>([]);
+  const [activeBlock, setActiveBlock] = useState<any | null>(null);
+  const [blockContent, setBlockContent] = useState('');
+  const [contextError, setContextError] = useState<string | null>(null);
+  const [contextSaved, setContextSaved] = useState(false);
+
+  // Modals (Phase 3)
+  const [showHandoffModal, setShowHandoffModal] = useState(false);
+  const [handoffUserId, setHandoffUserId] = useState('01935e40-0002-7000-8000-000000000002');
+  const [handoffNote, setHandoffNote] = useState('');
+
+  const [showForkModal, setShowForkModal] = useState(false);
+  const [forkAtSeq, setForkAtSeq] = useState<number>(0);
+  const [forkEditedMessage, setForkEditedMessage] = useState('');
+
+  const [showGraphModal, setShowGraphModal] = useState(false);
+
+  // Human tool command execution during takeover
+  const [humanToolCmd, setHumanToolCmd] = useState('');
 
   // Virtualization / Auto-scroll
   const timelineBottomRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [newEventsCount, setNewEventsCount] = useState(0);
 
-  // Load initial snapshot and open SSE
+  // Fetch context blocks
+  const fetchContextBlocks = async () => {
+    try {
+      const res = await fetch(`${API_URL}/v1/runs/${runId}/context-blocks`);
+      if (res.ok) {
+        const data = await res.json();
+        setContextBlocks(data.blocks || []);
+        if (data.blocks && data.blocks.length > 0 && !activeBlock) {
+          setActiveBlock(data.blocks[0]);
+          setBlockContent(data.blocks[0].content);
+        }
+      }
+    } catch {}
+  };
+
+  // Load initial snapshot, context blocks, and open SSE
   useEffect(() => {
     let eventSource: EventSource | null = null;
     let ws: WebSocket | null = null;
@@ -71,7 +110,6 @@ export default function RunRoomPage() {
 
     async function init() {
       try {
-        // 1. Initial snapshot
         const res = await fetch(`${API_URL}/v1/runs/${runId}`);
         if (res.ok) {
           const data = await res.json();
@@ -81,7 +119,9 @@ export default function RunRoomPage() {
         }
       } catch {}
 
-      // 2. Connect SSE stream
+      await fetchContextBlocks();
+
+      // Connect SSE stream
       try {
         const streamUrl = `${API_URL}/v1/runs/${runId}/stream?after=${runState.lastSeq}`;
         eventSource = new EventSource(streamUrl);
@@ -96,6 +136,11 @@ export default function RunRoomPage() {
 
             setRunState((prev) => applyEvent(prev, envelope));
 
+            // Refresh context blocks if context was edited
+            if (envelope.type.startsWith('context.')) {
+              fetchContextBlocks();
+            }
+
             if (!autoScroll) {
               setNewEventsCount((c) => c + 1);
             }
@@ -108,12 +153,12 @@ export default function RunRoomPage() {
         setConnected(false);
       }
 
-      // 3. Connect WebSocket for Presence
+      // Connect WebSocket for Presence
       try {
         ws = new WebSocket(WS_URL);
         ws.onopen = () => {
           const userSaved = localStorage.getItem('agentroom_user');
-          const user = userSaved ? JSON.parse(userSaved) : { id: 'sara', name: 'Sara Chen' };
+          const user = userSaved ? JSON.parse(userSaved) : { id: '01935e40-0002-7000-8000-000000000001', name: 'Sara Chen' };
 
           ws?.send(
             JSON.stringify({
@@ -211,6 +256,89 @@ export default function RunRoomPage() {
     } catch {}
   };
 
+  const handleExecuteHumanTool = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!humanToolCmd.trim()) return;
+
+    try {
+      await fetch(`${API_URL}/v1/runs/${runId}/tools/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'run_command',
+          arguments: { command: humanToolCmd },
+        }),
+      });
+      setHumanToolCmd('');
+    } catch {}
+  };
+
+  const handleSaveContextBlock = async () => {
+    if (!activeBlock) return;
+    setContextError(null);
+    setContextSaved(false);
+
+    try {
+      const res = await fetch(`${API_URL}/v1/context-blocks/${activeBlock.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          baseVersion: activeBlock.currentVersion,
+          content: blockContent,
+        }),
+      });
+
+      if (res.status === 409) {
+        const err = await res.json();
+        setContextError(`Conflict: Block updated by another user (latest v${err.error?.latestVersion}). Loaded latest content.`);
+        setBlockContent(err.error?.latestContent || blockContent);
+        await fetchContextBlocks();
+        return;
+      }
+
+      if (res.ok) {
+        setContextSaved(true);
+        setTimeout(() => setContextSaved(false), 3000);
+        await fetchContextBlocks();
+      }
+    } catch (err: any) {
+      setContextError(err.message);
+    }
+  };
+
+  const handleHandoff = async () => {
+    try {
+      await fetch(`${API_URL}/v1/runs/${runId}/handoff`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          toUserId: handoffUserId,
+          note: handoffNote,
+        }),
+      });
+      setShowHandoffModal(false);
+      setHandoffNote('');
+    } catch {}
+  };
+
+  const handleFork = async () => {
+    try {
+      const res = await fetch(`${API_URL}/v1/runs/${runId}/fork`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          atSeq: forkAtSeq || runState.lastSeq,
+          editedMessage: forkEditedMessage || undefined,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setShowForkModal(false);
+        router.push(`/${orgSlug}/runs/${data.run.id}`);
+      }
+    } catch {}
+  };
+
   const handleApprove = async (approvalId: string, approved: boolean) => {
     try {
       await fetch(`${API_URL}/v1/runs/${runId}/approvals/${approvalId}`, {
@@ -263,6 +391,8 @@ export default function RunRoomPage() {
                     ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
                     : runState.status === 'awaiting_approval'
                     ? 'bg-[#da7756]/15 text-[#da7756] border-[#da7756]/40'
+                    : runState.status === 'human_driving'
+                    ? 'bg-purple-500/15 text-purple-400 border-purple-500/30'
                     : 'bg-blue-500/10 text-blue-400 border-blue-500/30'
                 }`}
               >
@@ -297,7 +427,7 @@ export default function RunRoomPage() {
         </div>
 
         {/* Right side of Top Bar */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
           {/* Presence avatars */}
           <div className="flex items-center -space-x-1.5 pr-2 border-r border-[#292826]">
             {presenceUsers.length > 0 ? (
@@ -330,7 +460,7 @@ export default function RunRoomPage() {
           <div className="flex items-center gap-1.5">
             <button
               onClick={startSimulation}
-              title="Start ScriptedProvider agent loop in sandbox"
+              title="Start Agent loop in sandbox"
               className="px-2.5 py-1.5 rounded-lg bg-[#da7756] hover:bg-[#c66545] text-xs font-semibold text-white flex items-center gap-1.5 transition shadow"
             >
               <Play className="w-3.5 h-3.5 fill-current" /> Run Agent
@@ -340,13 +470,13 @@ export default function RunRoomPage() {
               onClick={handlePauseResume}
               className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] text-xs font-medium text-white flex items-center gap-1.5 transition"
             >
-              {runState.status === 'running' ? (
+              {runState.status === 'paused' ? (
                 <>
-                  <Pause className="w-3.5 h-3.5 text-amber-400" /> Pause
+                  <Play className="w-3.5 h-3.5 text-emerald-400" /> Resume
                 </>
               ) : (
                 <>
-                  <Play className="w-3.5 h-3.5 text-emerald-400" /> Resume
+                  <Pause className="w-3.5 h-3.5 text-amber-400" /> Pause
                 </>
               )}
             </button>
@@ -355,12 +485,42 @@ export default function RunRoomPage() {
               onClick={handleTakeover}
               className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition border ${
                 runState.driver.type === 'human'
-                  ? 'bg-[#da7756] text-white border-[#da7756]'
+                  ? 'bg-purple-600 text-white border-purple-500'
                   : 'bg-[#22211f] hover:bg-[#2b2a27] text-white border-[#33312e]'
               }`}
             >
               <HandMetal className="w-3.5 h-3.5" />
-              {runState.driver.type === 'human' ? 'Hand back to Agent' : 'Take over'}
+              {runState.driver.type === 'human' ? 'Hand back' : 'Take over'}
+            </button>
+
+            {/* Phase 3: Handoff Button */}
+            <button
+              onClick={() => setShowHandoffModal(true)}
+              className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] text-xs font-medium text-white flex items-center gap-1.5 transition"
+              title="Hand off driver control to a teammate"
+            >
+              <ArrowRightLeft className="w-3.5 h-3.5 text-blue-400" /> Handoff
+            </button>
+
+            {/* Phase 3: Fork Button */}
+            <button
+              onClick={() => {
+                setForkAtSeq(runState.lastSeq);
+                setShowForkModal(true);
+              }}
+              className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] text-xs font-medium text-white flex items-center gap-1.5 transition"
+              title="Fork run from current step"
+            >
+              <GitFork className="w-3.5 h-3.5 text-emerald-400" /> Fork
+            </button>
+
+            {/* Phase 3: Graph View Button */}
+            <button
+              onClick={() => setShowGraphModal(true)}
+              className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] text-xs font-medium text-white flex items-center gap-1.5 transition"
+              title="View Run Lineage and Fork Tree"
+            >
+              <GitBranch className="w-3.5 h-3.5 text-purple-400" /> Graph
             </button>
 
             <UserSwitcher />
@@ -429,10 +589,7 @@ export default function RunRoomPage() {
 
         {/* CENTER: TIMELINE & STREAM */}
         <section className="flex-1 flex flex-col bg-[#141413] min-w-0 relative">
-          <div
-            onScroll={handleScroll}
-            className="flex-1 overflow-y-auto p-6 space-y-4"
-          >
+          <div onScroll={handleScroll} className="flex-1 overflow-y-auto p-6 space-y-4">
             {events.length === 0 ? (
               <div className="text-center py-20 space-y-3">
                 <Bot className="w-10 h-10 text-[#da7756] mx-auto animate-bounce" />
@@ -467,7 +624,19 @@ export default function RunRoomPage() {
                               {payload.mode}
                             </span>
                           </div>
-                          <span className="text-[10px] text-[#666460] font-mono">Seq {ev.seq}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] text-[#666460] font-mono">Seq {ev.seq}</span>
+                            <button
+                              onClick={() => {
+                                setForkAtSeq(ev.seq);
+                                setShowForkModal(true);
+                              }}
+                              className="text-[10px] px-1.5 py-0.5 rounded bg-[#22211f] hover:bg-[#2b2a27] text-zinc-400 hover:text-white flex items-center gap-1 transition"
+                              title="Fork from this message"
+                            >
+                              <GitFork className="w-3 h-3 text-emerald-400" /> Fork
+                            </button>
+                          </div>
                         </div>
                         <div className="text-sm text-[#f0eeeb] leading-relaxed">{payload.text}</div>
                         <div className="mt-1.5 text-[10px] text-emerald-400/80 flex items-center gap-1 font-mono">
@@ -492,7 +661,19 @@ export default function RunRoomPage() {
                       <div className="flex-1 min-w-0 space-y-2">
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-semibold text-[#da7756]">Claude Agent</span>
-                          <span className="text-[10px] text-[#666460] font-mono">Seq {ev.seq}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] text-[#666460] font-mono">Seq {ev.seq}</span>
+                            <button
+                              onClick={() => {
+                                setForkAtSeq(ev.seq);
+                                setShowForkModal(true);
+                              }}
+                              className="text-[10px] px-1.5 py-0.5 rounded bg-[#22211f] hover:bg-[#2b2a27] text-zinc-400 hover:text-white flex items-center gap-1 transition"
+                              title="Fork from this step"
+                            >
+                              <GitFork className="w-3 h-3 text-emerald-400" /> Fork
+                            </button>
+                          </div>
                         </div>
                         <div className="text-sm text-[#e8e6e3] leading-relaxed select-text font-sans whitespace-pre-wrap">
                           {payload.text}
@@ -520,6 +701,11 @@ export default function RunRoomPage() {
                           >
                             {payload.ok ? 'OK' : 'FAILED'}
                           </span>
+                          {ev.actorType === 'human' && (
+                            <span className="text-[10px] px-1.5 py-0.2 rounded bg-purple-950/40 text-purple-300 font-mono">
+                              Human Driver
+                            </span>
+                          )}
                         </div>
                         <span className="text-[10px] text-[#888580] font-mono">{payload.durationMs || 10}ms</span>
                       </div>
@@ -589,7 +775,28 @@ export default function RunRoomPage() {
           )}
 
           {/* BOTTOM COMPOSER */}
-          <div className="p-4 border-t border-[#292826] bg-[#181716] shrink-0">
+          <div className="p-4 border-t border-[#292826] bg-[#181716] shrink-0 space-y-3">
+            {/* If Human Driving, show Human Command Terminal */}
+            {runState.driver.type === 'human' && (
+              <form onSubmit={handleExecuteHumanTool} className="p-2.5 rounded-xl border border-purple-500/40 bg-purple-950/20 flex items-center gap-2">
+                <Terminal className="w-4 h-4 text-purple-400 shrink-0" />
+                <input
+                  type="text"
+                  value={humanToolCmd}
+                  onChange={(e) => setHumanToolCmd(e.target.value)}
+                  placeholder="You are driving! Execute shell command in sandbox (e.g. 'pnpm test:auth')..."
+                  className="flex-1 bg-transparent text-xs text-purple-200 placeholder-purple-400/60 focus:outline-none font-mono"
+                />
+                <button
+                  type="submit"
+                  disabled={!humanToolCmd.trim()}
+                  className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-xs font-semibold text-white transition"
+                >
+                  Run
+                </button>
+              </form>
+            )}
+
             <form onSubmit={handleSendMessage} className="space-y-2">
               <div className="flex items-center justify-between text-xs text-[#888580]">
                 <div className="flex items-center gap-2">
@@ -650,9 +857,7 @@ export default function RunRoomPage() {
             <button
               onClick={() => setActiveTab('context')}
               className={`text-xs font-medium px-2.5 py-1 rounded-md transition ${
-                activeTab === 'context'
-                  ? 'bg-[#252422] text-[#da7756]'
-                  : 'text-[#888580] hover:text-white'
+                activeTab === 'context' ? 'bg-[#252422] text-[#da7756]' : 'text-[#888580] hover:text-white'
               }`}
             >
               Context
@@ -660,9 +865,7 @@ export default function RunRoomPage() {
             <button
               onClick={() => setActiveTab('files')}
               className={`text-xs font-medium px-2.5 py-1 rounded-md transition ${
-                activeTab === 'files'
-                  ? 'bg-[#252422] text-[#da7756]'
-                  : 'text-[#888580] hover:text-white'
+                activeTab === 'files' ? 'bg-[#252422] text-[#da7756]' : 'text-[#888580] hover:text-white'
               }`}
             >
               Files
@@ -670,9 +873,7 @@ export default function RunRoomPage() {
             <button
               onClick={() => setActiveTab('people')}
               className={`text-xs font-medium px-2.5 py-1 rounded-md transition ${
-                activeTab === 'people'
-                  ? 'bg-[#252422] text-[#da7756]'
-                  : 'text-[#888580] hover:text-white'
+                activeTab === 'people' ? 'bg-[#252422] text-[#da7756]' : 'text-[#888580] hover:text-white'
               }`}
             >
               People ({presenceUsers.length || 3})
@@ -680,9 +881,7 @@ export default function RunRoomPage() {
             <button
               onClick={() => setActiveTab('limits')}
               className={`text-xs font-medium px-2.5 py-1 rounded-md transition ${
-                activeTab === 'limits'
-                  ? 'bg-[#252422] text-[#da7756]'
-                  : 'text-[#888580] hover:text-white'
+                activeTab === 'limits' ? 'bg-[#252422] text-[#da7756]' : 'text-[#888580] hover:text-white'
               }`}
             >
               Limits
@@ -692,22 +891,41 @@ export default function RunRoomPage() {
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
             {activeTab === 'context' && (
               <div className="space-y-4">
-                <div className="p-3 rounded-xl border border-[#2e2d2a] bg-[#1c1b1a]">
-                  <div className="flex items-center justify-between mb-2">
+                {contextError && (
+                  <div className="p-2.5 rounded-lg border border-red-500/40 bg-red-950/20 text-red-300 text-xs flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                    <span>{contextError}</span>
+                  </div>
+                )}
+
+                {contextSaved && (
+                  <div className="p-2 rounded-lg border border-emerald-500/40 bg-emerald-950/20 text-emerald-300 text-xs flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>Saved! Broadcasted to agent on next step.</span>
+                  </div>
+                )}
+
+                <div className="p-3 rounded-xl border border-[#2e2d2a] bg-[#1c1b1a] space-y-2">
+                  <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold text-white flex items-center gap-1.5">
                       <Lock className="w-3.5 h-3.5 text-[#da7756]" />
-                      Instructions (v2)
+                      {activeBlock?.title || 'Instructions'} (v{activeBlock?.currentVersion || 1})
                     </span>
-                    <span className="text-[10px] text-emerald-400 font-mono">Live</span>
+                    <button
+                      onClick={handleSaveContextBlock}
+                      className="px-2 py-1 rounded bg-[#da7756] hover:bg-[#c66545] text-white text-[11px] font-semibold flex items-center gap-1 transition"
+                    >
+                      <Save className="w-3 h-3" /> Save
+                    </button>
                   </div>
                   <textarea
-                    rows={6}
-                    value={instructions}
-                    onChange={(e) => setInstructions(e.target.value)}
+                    rows={7}
+                    value={blockContent}
+                    onChange={(e) => setBlockContent(e.target.value)}
                     className="w-full bg-[#121110] border border-[#292826] rounded-lg p-2.5 text-xs text-[#c2bfba] font-mono focus:border-[#da7756] focus:outline-none transition leading-relaxed resize-none"
                   />
-                  <div className="text-[10px] text-[#666460] mt-1">
-                    Auto-broadcasted to agent on next step
+                  <div className="text-[10px] text-[#666460]">
+                    Block-level versioning with 30s soft-lock protection.
                   </div>
                 </div>
 
@@ -782,6 +1000,188 @@ export default function RunRoomPage() {
           </div>
         </aside>
       </div>
+
+      {/* PHASE 3: HANDOFF MODAL */}
+      {showHandoffModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4 backdrop-blur-sm">
+          <div className="bg-[#1c1b1a] border border-[#383632] rounded-2xl w-full max-w-md p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                <ArrowRightLeft className="w-4 h-4 text-blue-400" />
+                Hand off Driver Control
+              </h3>
+              <button
+                onClick={() => setShowHandoffModal(false)}
+                className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-400"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="text-zinc-400 block mb-1">Select Teammate</label>
+                <select
+                  value={handoffUserId}
+                  onChange={(e) => setHandoffUserId(e.target.value)}
+                  className="w-full bg-[#121110] border border-[#2e2d2a] rounded-lg p-2.5 text-white focus:outline-none"
+                >
+                  <option value="01935e40-0002-7000-8000-000000000002">Ahmed Hassan (Admin)</option>
+                  <option value="01935e40-0002-7000-8000-000000000003">Lina Mori (Engineer)</option>
+                  <option value="01935e40-0002-7000-8000-000000000001">Sara Chen (Owner)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-zinc-400 block mb-1">Handoff Note (Optional)</label>
+                <textarea
+                  rows={3}
+                  value={handoffNote}
+                  onChange={(e) => setHandoffNote(e.target.value)}
+                  placeholder="e.g. Taking lunch, please monitor step 3 and approve database migration."
+                  className="w-full bg-[#121110] border border-[#2e2d2a] rounded-lg p-2.5 text-white focus:outline-none resize-none"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                onClick={() => setShowHandoffModal(false)}
+                className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-white"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleHandoff}
+                className="px-3.5 py-1.5 rounded-lg bg-[#da7756] hover:bg-[#c66545] text-xs font-semibold text-white"
+              >
+                Request Handoff
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PHASE 3: FORK MODAL */}
+      {showForkModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4 backdrop-blur-sm">
+          <div className="bg-[#1c1b1a] border border-[#383632] rounded-2xl w-full max-w-md p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                <GitFork className="w-4 h-4 text-emerald-400" />
+                Fork Run (Edit-and-Rerun)
+              </h3>
+              <button
+                onClick={() => setShowForkModal(false)}
+                className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-400"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="text-zinc-400 block mb-1">Fork from Sequence Number</label>
+                <input
+                  type="number"
+                  value={forkAtSeq}
+                  onChange={(e) => setForkAtSeq(Number(e.target.value))}
+                  className="w-full bg-[#121110] border border-[#2e2d2a] rounded-lg p-2.5 text-white font-mono focus:outline-none"
+                />
+                <p className="text-[10px] text-zinc-500 mt-1">
+                  Events 1 through {forkAtSeq} will be cloned into the new run.
+                </p>
+              </div>
+
+              <div>
+                <label className="text-zinc-400 block mb-1">Edited Steering Message (Optional)</label>
+                <textarea
+                  rows={3}
+                  value={forkEditedMessage}
+                  onChange={(e) => setForkEditedMessage(e.target.value)}
+                  placeholder="e.g. Try an alternative migration strategy without touching the legacy schema..."
+                  className="w-full bg-[#121110] border border-[#2e2d2a] rounded-lg p-2.5 text-white focus:outline-none resize-none"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                onClick={() => setShowForkModal(false)}
+                className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-white"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleFork}
+                className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white"
+              >
+                Create Fork & Launch
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PHASE 3: GRAPH VIEW MODAL */}
+      {showGraphModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-6 backdrop-blur-md">
+          <div className="bg-[#181716] border border-[#383632] rounded-2xl w-full max-w-3xl p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
+              <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                <GitBranch className="w-4 h-4 text-purple-400" />
+                Run Lineage & Fork Graph
+              </h3>
+              <button
+                onClick={() => setShowGraphModal(false)}
+                className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-400"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 bg-[#121110] rounded-xl border border-zinc-800 min-h-[240px] flex items-center justify-center">
+              <div className="space-y-6 w-full max-w-md">
+                {/* Parent Node */}
+                <div className="p-3.5 rounded-xl border border-[#da7756]/60 bg-[#1c1b1a] shadow-lg flex items-center justify-between">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-3 h-3 rounded-full bg-emerald-400 animate-pulse" />
+                    <div>
+                      <div className="text-xs font-semibold text-white">{runState.title}</div>
+                      <div className="text-[10px] text-zinc-400 font-mono">ID: {runId.slice(0, 8)}... (Mainline)</div>
+                    </div>
+                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-950/60 text-emerald-400 font-mono">
+                    Seq {runState.lastSeq}
+                  </span>
+                </div>
+
+                {/* Connecting branch line */}
+                <div className="pl-6 border-l-2 border-dashed border-[#da7756]/40 ml-6 space-y-4">
+                  <div className="p-3 rounded-xl border border-zinc-700 bg-[#181716] flex items-center justify-between">
+                    <div>
+                      <div className="text-xs font-medium text-purple-300">Fork: Alternative Schema Strategy</div>
+                      <div className="text-[10px] text-zinc-500 font-mono">Branched at Seq 4 • Created by Ahmed</div>
+                    </div>
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-purple-950/40 text-purple-400 font-mono">
+                      Active
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end">
+              <button
+                onClick={() => setShowGraphModal(false)}
+                className="px-4 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-white"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

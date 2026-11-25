@@ -21,6 +21,7 @@ class InMemoryStore {
   comments = new Map<string, any>();
   contextBlocks = new Map<string, any>();
   contextVersions = new Map<string, any>();
+  handoffs = new Map<string, any>();
   policies = new Map<string, any>();
   blobs = new Map<string, any>();
   knowledgeItems = new Map<string, any>();
@@ -238,5 +239,325 @@ export class RunRepository {
 
     const list = inMemoryDb.events.get(runId) || [];
     return list.filter((e) => e.seq > after).slice(0, limit);
+  }
+
+  // ==========================================
+  // PHASE 3: CONTEXT BLOCKS & VERSIONING
+  // ==========================================
+  async getContextBlocks(orgId: string, runId?: string, projectId?: string) {
+    const db = await this.getDrizzle();
+    if (db) {
+      // Postgres implementation
+      const rows = await db
+        .select()
+        .from(schema.contextBlocks)
+        .where(
+          and(
+            eq(schema.contextBlocks.orgId, orgId),
+            runId ? eq(schema.contextBlocks.runId, runId) : sql`TRUE`,
+            projectId ? eq(schema.contextBlocks.projectId, projectId) : sql`TRUE`
+          )
+        );
+      return rows;
+    }
+
+    const blocks: any[] = [];
+    for (const b of inMemoryDb.contextBlocks.values()) {
+      if (b.orgId === orgId) {
+        if (!runId && !projectId) {
+          blocks.push(b);
+        } else if (runId && b.runId === runId) {
+          blocks.push(b);
+        } else if (projectId && b.projectId === projectId) {
+          blocks.push(b);
+        }
+      }
+    }
+    return blocks;
+  }
+
+  async createContextBlock(orgId: string, data: {
+    runId?: string;
+    projectId?: string;
+    kind: 'instructions' | 'notes' | 'pinned_files' | 'memory';
+    title: string;
+    content: string;
+    userId?: string;
+  }) {
+    const blockId = uuidv7();
+    const now = new Date();
+
+    const block = {
+      id: blockId,
+      orgId,
+      runId: data.runId || null,
+      projectId: data.projectId || null,
+      kind: data.kind,
+      title: data.title,
+      position: 0,
+      currentVersion: 1,
+      enabled: true,
+      content: data.content,
+      lockedBy: null,
+      lockExpiresAt: null,
+      createdAt: now,
+    };
+
+    inMemoryDb.contextBlocks.set(blockId, block);
+    inMemoryDb.contextVersions.set(`${blockId}:1`, {
+      blockId,
+      version: 1,
+      content: data.content,
+      editedBy: data.userId || null,
+      createdAt: now,
+    });
+
+    if (data.runId) {
+      await this.appendEvent(data.runId, {
+        runId: data.runId,
+        type: 'context.block_added',
+        actorType: 'human',
+        actorId: data.userId || null,
+        payload: {
+          blockId,
+          kind: data.kind,
+          title: data.title,
+          content: data.content,
+        },
+      });
+    }
+
+    return block;
+  }
+
+  async updateContextBlock(
+    blockId: string,
+    baseVersion: number,
+    content: string,
+    userId: string
+  ) {
+    const block = inMemoryDb.contextBlocks.get(blockId);
+    if (!block) {
+      throw new Error(`Context block ${blockId} not found`);
+    }
+
+    // Version conflict check (Section 12.4)
+    if (block.currentVersion !== baseVersion) {
+      const err: any = new Error(`Conflict: Base version ${baseVersion} does not match current version ${block.currentVersion}`);
+      err.code = 'VERSION_CONFLICT';
+      err.latestContent = block.content;
+      err.latestVersion = block.currentVersion;
+      throw err;
+    }
+
+    const nextVersion = block.currentVersion + 1;
+    const fromVersion = block.currentVersion;
+    block.currentVersion = nextVersion;
+    block.content = content;
+
+    inMemoryDb.contextVersions.set(`${blockId}:${nextVersion}`, {
+      blockId,
+      version: nextVersion,
+      content,
+      editedBy: userId,
+      createdAt: new Date(),
+    });
+
+    // Append context.edited event if attached to a run
+    if (block.runId) {
+      await this.appendEvent(block.runId, {
+        runId: block.runId,
+        type: 'context.edited',
+        actorType: 'human',
+        actorId: userId,
+        payload: {
+          blockId,
+          fromVersion,
+          toVersion: nextVersion,
+          summary: `Context block ${block.title} updated by user to v${nextVersion}`,
+          content,
+        },
+      });
+    }
+
+    return block;
+  }
+
+  async acquireBlockLock(blockId: string, userId: string, ttlMs: number = 30000) {
+    const block = inMemoryDb.contextBlocks.get(blockId);
+    if (!block) throw new Error(`Context block ${blockId} not found`);
+
+    const now = Date.now();
+    if (block.lockedBy && block.lockedBy !== userId && block.lockExpiresAt && new Date(block.lockExpiresAt).getTime() > now) {
+      const err: any = new Error(`Block is locked by another user`);
+      err.code = 'LOCKED';
+      err.lockedBy = block.lockedBy;
+      throw err;
+    }
+
+    block.lockedBy = userId;
+    block.lockExpiresAt = new Date(now + ttlMs);
+    return { locked: true, lockedBy: userId, expiresAt: block.lockExpiresAt };
+  }
+
+  async releaseBlockLock(blockId: string, userId: string) {
+    const block = inMemoryDb.contextBlocks.get(blockId);
+    if (!block) return { released: true };
+
+    if (block.lockedBy === userId) {
+      block.lockedBy = null;
+      block.lockExpiresAt = null;
+    }
+    return { released: true };
+  }
+
+  // ==========================================
+  // PHASE 3: HANDOFFS & DRIVER TRANSFERS
+  // ==========================================
+  async createHandoff(orgId: string, runId: string, fromUserId: string | null, toUserId: string, kind: 'takeover' | 'handoff' | 'handback_to_agent', note?: string) {
+    const handoffId = uuidv7();
+    const handoff = {
+      id: handoffId,
+      orgId,
+      runId,
+      fromUserId,
+      toUserId,
+      kind,
+      status: 'requested',
+      note: note || '',
+      createdAt: new Date(),
+    };
+    inMemoryDb.handoffs.set(handoffId, handoff);
+
+    await this.appendEvent(runId, {
+      runId,
+      type: 'handoff.requested',
+      actorType: 'human',
+      actorId: fromUserId,
+      payload: {
+        handoffId,
+        fromUserId,
+        toUserId,
+        note,
+      },
+    });
+
+    return handoff;
+  }
+
+  async resolveHandoff(handoffId: string, status: 'accepted' | 'declined', resolvedByUserId?: string) {
+    const handoff = inMemoryDb.handoffs.get(handoffId);
+    if (!handoff) throw new Error(`Handoff ${handoffId} not found`);
+
+    handoff.status = status;
+    handoff.resolvedAt = new Date();
+
+    if (status === 'accepted') {
+      await this.appendEvent(handoff.runId, {
+        runId: handoff.runId,
+        type: 'handoff.accepted',
+        actorType: 'human',
+        actorId: resolvedByUserId || handoff.toUserId,
+        payload: {
+          handoffId,
+        },
+      });
+
+      // Change driver to the recipient
+      await this.appendEvent(handoff.runId, {
+        runId: handoff.runId,
+        type: 'driver.changed',
+        actorType: 'system',
+        actorId: null,
+        payload: {
+          from: { type: 'human', userId: handoff.fromUserId },
+          to: { type: 'human', userId: handoff.toUserId },
+        },
+      });
+    } else {
+      await this.appendEvent(handoff.runId, {
+        runId: handoff.runId,
+        type: 'handoff.declined',
+        actorType: 'human',
+        actorId: resolvedByUserId || handoff.toUserId,
+        payload: {
+          handoffId,
+          reason: 'Declined by recipient',
+        },
+      });
+    }
+
+    return handoff;
+  }
+
+  // ==========================================
+  // PHASE 3: FORK WITH EDIT-AND-RERUN (Section 9.8)
+  // ==========================================
+  async forkRun(parentRunId: string, atSeq: number, editedMessage?: string, userId?: string) {
+    const parentRun = inMemoryDb.runs.get(parentRunId);
+    if (!parentRun) throw new Error(`Parent run ${parentRunId} not found`);
+
+    const newRunId = uuidv7();
+    const now = new Date();
+
+    // 1. Create forked run
+    const forkedRun = {
+      ...parentRun,
+      id: newRunId,
+      title: `${parentRun.title} (Fork from Step ${atSeq})`,
+      status: 'queued',
+      parentRunId,
+      forkedAtSeq: atSeq,
+      lastSeq: 0,
+      lastAppliedSeq: 0,
+      createdAt: now,
+    };
+    inMemoryDb.runs.set(newRunId, forkedRun);
+
+    // 2. Copy events 1..atSeq with new IDs
+    const parentEvents = inMemoryDb.events.get(parentRunId) || [];
+    const eventsToCopy = parentEvents.filter((e) => e.seq <= atSeq);
+    const newEvents: EventEnvelope[] = [];
+
+    for (const ev of eventsToCopy) {
+      forkedRun.lastSeq++;
+      const copiedEvent: EventEnvelope = {
+        ...ev,
+        id: uuidv7(),
+        runId: newRunId,
+        seq: forkedRun.lastSeq,
+        createdAt: now.toISOString(),
+      };
+      newEvents.push(copiedEvent);
+    }
+    inMemoryDb.events.set(newRunId, newEvents);
+
+    // 3. If editedMessage, append user message at fork point
+    if (editedMessage) {
+      await this.appendEvent(newRunId, {
+        runId: newRunId,
+        type: 'message.user',
+        actorType: 'human',
+        actorId: userId || null,
+        payload: {
+          text: editedMessage,
+          mode: 'queue',
+        },
+      });
+    }
+
+    // 4. Bidirectional link: append run.forked to parent
+    await this.appendEvent(parentRunId, {
+      runId: parentRunId,
+      type: 'run.forked',
+      actorType: 'system',
+      actorId: null,
+      payload: {
+        newRunId,
+        atSeq,
+      },
+    });
+
+    return forkedRun;
   }
 }

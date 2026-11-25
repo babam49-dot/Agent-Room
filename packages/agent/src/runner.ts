@@ -8,17 +8,38 @@ import {
 import type { EventEnvelope, RunStatus } from '@agentroom/core';
 import { RunRepository } from '@agentroom/db';
 import { ScriptedProvider } from './providers/scripted.js';
+import { OpenAIProvider } from './providers/openai.js';
 import { FakeSandbox } from './sandbox/fake.js';
+
+export interface LLMProvider {
+  stream(req: {
+    system: string;
+    messages: any[];
+    tools: any[];
+    signal: AbortSignal;
+    onTextDelta?: (t: string) => void;
+  }): Promise<{
+    text: string;
+    toolCalls: Array<{ id: string; name: string; arguments: Record<string, any> }>;
+    stopReason: string;
+    usage?: { inputTokens?: number; outputTokens?: number };
+    aborted?: boolean;
+  }>;
+}
 
 export interface RunnerOptions {
   stepDelayMs?: number;
   scriptName?: string;
+  provider?: 'scripted' | 'openai' | 'anthropic';
+  apiKey?: string;
+  baseURL?: string;
+  model?: string;
 }
 
 export class AgentRunner {
   private repository: RunRepository;
   private sandbox: FakeSandbox;
-  private provider: ScriptedProvider;
+  private provider: LLMProvider;
   private abortController: AbortController = new AbortController();
   private isRunning = false;
   private pendingApprovalResolve: ((decision: 'approved' | 'denied') => void) | null = null;
@@ -29,7 +50,16 @@ export class AgentRunner {
   ) {
     this.repository = new RunRepository();
     this.sandbox = new FakeSandbox();
-    this.provider = new ScriptedProvider(options.scriptName || 'migrate-api-endpoint');
+
+    if (options.provider === 'openai' || (!options.provider && process.env.OPENAI_API_KEY)) {
+      this.provider = new OpenAIProvider({
+        apiKey: options.apiKey || process.env.OPENAI_API_KEY,
+        baseURL: options.baseURL || process.env.OPENAI_BASE_URL,
+        model: options.model || process.env.OPENAI_MODEL,
+      });
+    } else {
+      this.provider = new ScriptedProvider(options.scriptName || 'migrate-api-endpoint');
+    }
   }
 
   getAbortSignal() {
@@ -69,7 +99,7 @@ export class AgentRunner {
           } else if (msg.type === 'approval_decided') {
             this.resolveApproval(msg.decision);
           }
-        } catch {}
+        } catch { }
       }
     );
 
@@ -129,9 +159,25 @@ export class AgentRunner {
             content: (e.payload as any).text,
           }));
 
+        // Context assembly (Section 9.4)
+        let systemPrompt = 'You are an autonomous coding agent in a shared team room.';
+        for (const block of Object.values(state.contextBlocks)) {
+          systemPrompt += `\n\n[Context Block: ${block.title} (v${block.version})]\n${block.content}`;
+        }
+
+        // If human recently drove, inject what was done into messages
+        const humanActions = events.filter((e) => e.actorType === 'human' && e.type === 'tool.result');
+        if (humanActions.length > 0) {
+          const lastHumanAction = humanActions[humanActions.length - 1];
+          messages.push({
+            role: 'user',
+            content: `[Notice on Handback]: While the teammate was driving, they executed: ${(lastHumanAction?.payload as any).output}`,
+          });
+        }
+
         // Stream model response
         const result = await this.provider.stream({
-          system: 'You are an autonomous coding agent in a shared team room.',
+          system: systemPrompt,
           messages,
           tools: [],
           signal: this.abortController.signal,
@@ -228,10 +274,10 @@ export class AgentRunner {
           const risk = call.name.startsWith('read')
             ? 'read'
             : call.name.startsWith('write')
-            ? 'write'
-            : call.name === 'run_command'
-            ? 'exec'
-            : 'meta';
+              ? 'write'
+              : call.name === 'run_command'
+                ? 'exec'
+                : 'meta';
 
           const decision = evaluatePolicy({
             tool: call.name,

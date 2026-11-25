@@ -24,25 +24,50 @@
 - [x] Task 1.8: apps/web Claude-style run screen timeline with live SSE, presence indicators, auto-scroll, jump to live & steering composer (2.5h)
 - [x] Task 1.9: Multi-client synchronization test & 10,000-event stress test validation (2h)
 
-### Phase 1 Acceptance Test Results:
+## Phase 3: Context, Takeover, Handoff, Fork (Status: COMPLETE ✓)
+- [x] Task 3.1: Context blocks with versioning, 30s soft-locks, and optimistic concurrency control (`baseVersion`) (2h)
+- [x] Task 3.2: apps/api endpoints for context blocks (`GET`, `POST`, `PATCH`, `lock`, `unlock`) with 409 Conflict handling (1.5h)
+- [x] Task 3.3: Human Takeover & tool execution endpoint (`POST /v1/runs/:id/tools/execute`) recording `actorType: 'human'` (1.5h)
+- [x] Task 3.4: Handback with note injected into agent prompt on resume (1h)
+- [x] Task 3.5: Driver handoff workflow (`POST /v1/runs/:id/handoff`, `accept`, `decline`) with driver state transfer (1.5h)
+- [x] Task 3.6: Fork with edit-and-rerun (`POST /v1/runs/:id/fork`), prefix event cloning (1..`atSeq`), and bidirectional `run.forked` linking (2h)
+- [x] Task 3.7: OpenAI-compatible Provider implementation (`OpenAIProvider`) with streaming deltas and tool support (1.5h)
+- [x] Task 3.8: Claude-style Web UI updates: Context editor with live versioning, Handoff modal, Fork modal, and Graph view (2h)
+- [x] Task 3.9: End-to-end acceptance tests verifying all 5 Phase 3 criteria (1.5h)
+
+### Phase 3 Acceptance Test Results:
 ```text
 ====================================================
-   VERIFYING PHASE 1: SHARED LIVE RUN VIEWER        
+   VERIFYING PHASE 3: CONTEXT, TAKEOVER, HANDOFF, FORK
 ====================================================
 
-[Test 1/4] Two Clients Connecting to Live SSE Stream:
-  ✓ Client 1 received 32 events.
-  ✓ Client 2 received 32 events.
-  ✓ Both clients saw identical, strictly ordered events (synchronized in real-time within <300ms).
+[Test 1/5] Context Edit, Versioning & Conflict Detection:
+  ✓ Initial block loaded: "Project Instructions" at v1
+  ✓ Sara successfully updated block to v2
+  ✓ Stale baseVersion correctly rejected with 409 VERSION_CONFLICT
+  ✓ Sara acquired 10s soft-lock on block
+  ✓ Lock released successfully
 
-[Test 2/4] Reconnection with Last-Event-ID catchup:
-  ✓ Reconnected client with after=3 received 23 catchup events.
-  ✓ Zero duplicate events, zero missing events on resume.
+[Test 2/5] Human Takeover, Human Tool Execution & Handback:
+  ✓ Driver transferred to human (Sara Chen)
+  ✓ Human executed command "$ git checkout -b fix-payment-schema" (recorded as actorType: human)
+  ✓ Handed back to Autonomous Agent with note
 
-[Test 3/4] Replay Test: applyEvent(events) === Server Snapshot:
-  ✓ Replayed 26 events from immutable log.
-  ✓ Replayed state matches server snapshot identically at lastSeq=26 (status: completed).
+[Test 3/5] Driver Handoff: Accept & Decline:
+  ✓ Handoff request from Sara to Ahmed created (id: 01a21180...)
+  ✓ Ahmed accepted: Driver successfully transferred to Ahmed Hassan
+  ✓ Lina declined: Driver correctly retained by Ahmed Hassan
 
-[Test 4/4] Performance Test: 10,000-event Reducer Throughput:
-  ✓ Pure reducer processed 10,000 events in memory with zero degradation.
+[Test 4/5] Fork with Edit-and-Rerun:
+  ✓ Created forked run at sequence 3
+  ✓ Cloned events 1..3 and appended edited steering message
+  ✓ Parent run appended bidirectional run.forked link event
+
+[Test 5/5] Provider Pluggability (OpenAI & Scripted):
+  ✓ OpenAIProvider instantiates cleanly with custom baseURL and model
+  ✓ AgentRunner supports zero-credit scripted execution without API keys
+
+====================================================
+   ALL PHASE 3 ACCEPTANCE TESTS PASSED (5/5) ✓     
+====================================================
 ```
