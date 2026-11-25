@@ -560,4 +560,197 @@ export class RunRepository {
 
     return forkedRun;
   }
+
+  // ==========================================
+  // PHASE 4: STEP COMMENTS (Section 13)
+  // ==========================================
+  async addComment(runId: string, data: {
+    targetSeq: number;
+    authorId: string;
+    body: string;
+    directsAgent?: boolean;
+  }) {
+    const commentId = uuidv7();
+    const comment = {
+      id: commentId,
+      runId,
+      targetSeq: data.targetSeq,
+      authorId: data.authorId,
+      body: data.body,
+      directsAgent: Boolean(data.directsAgent),
+      resolved: false,
+      createdAt: new Date(),
+    };
+    inMemoryDb.comments.set(commentId, comment);
+
+    // Append comment.added event
+    const envelope = await this.appendEvent(runId, {
+      runId,
+      type: 'comment.added',
+      actorType: 'human',
+      actorId: data.authorId,
+      payload: {
+        commentId,
+        targetSeq: data.targetSeq,
+        body: data.body,
+        directsAgent: Boolean(data.directsAgent),
+      },
+    });
+
+    // If directsAgent is true, notify the agent loop via control channel or message
+    if (data.directsAgent) {
+      await this.appendEvent(runId, {
+        runId,
+        type: 'message.user',
+        actorType: 'human',
+        actorId: data.authorId,
+        payload: {
+          text: `[Comment on Step ${data.targetSeq}]: ${data.body}`,
+          mode: 'queue',
+        },
+      });
+    }
+
+    return { comment, envelope };
+  }
+
+  async resolveComment(commentId: string, runId: string, userId: string) {
+    const comment = inMemoryDb.comments.get(commentId);
+    if (!comment) throw new Error(`Comment ${commentId} not found`);
+
+    comment.resolved = true;
+    const envelope = await this.appendEvent(runId, {
+      runId,
+      type: 'comment.resolved',
+      actorType: 'human',
+      actorId: userId,
+      payload: {
+        commentId,
+      },
+    });
+
+    return { comment, envelope };
+  }
+
+  async getComments(runId: string) {
+    const list: any[] = [];
+    for (const c of inMemoryDb.comments.values()) {
+      if (c.runId === runId) {
+        list.push(c);
+      }
+    }
+    return list;
+  }
+
+  // ==========================================
+  // PHASE 4: RUN SUMMARIZATION & KNOWLEDGE (Section 14)
+  // ==========================================
+  async summarizeRun(runId: string, data: {
+    summary: string;
+    title?: string;
+    tags?: string[];
+    userId?: string;
+  }) {
+    const run = inMemoryDb.runs.get(runId);
+    if (!run) throw new Error(`Run ${runId} not found`);
+
+    const knowledgeItemId = uuidv7();
+    const now = new Date();
+
+    run.summary = data.summary;
+    run.status = 'completed';
+
+    const knowledgeItem = {
+      id: knowledgeItemId,
+      orgId: run.orgId,
+      projectId: run.projectId,
+      runId,
+      title: data.title || `Summary: ${run.title}`,
+      bodyMd: data.summary,
+      tags: data.tags || ['run-summary', 'automation'],
+      createdBy: data.userId || run.createdBy,
+      createdAt: now,
+    };
+    inMemoryDb.knowledgeItems.set(knowledgeItemId, knowledgeItem);
+
+    // Append run.summarized event
+    const envelope = await this.appendEvent(runId, {
+      runId,
+      type: 'run.summarized',
+      actorType: 'system',
+      actorId: data.userId || null,
+      payload: {
+        summary: data.summary,
+        knowledgeItemId,
+      },
+    });
+
+    return { knowledgeItem, envelope };
+  }
+
+  async listKnowledgeItems(orgId: string, projectId?: string) {
+    const items: any[] = [];
+    for (const item of inMemoryDb.knowledgeItems.values()) {
+      if (item.orgId === orgId) {
+        if (!projectId || item.projectId === projectId) {
+          items.push(item);
+        }
+      }
+    }
+    return items;
+  }
+
+  // ==========================================
+  // PHASE 4: GLOBAL SEARCH & ACTIVITY FEED
+  // ==========================================
+  async search(orgId: string, query: string) {
+    const q = query.toLowerCase().trim();
+    if (!q) return { runs: [], knowledgeItems: [] };
+
+    const matchedRuns: any[] = [];
+    for (const r of inMemoryDb.runs.values()) {
+      if (r.orgId === orgId) {
+        const titleMatch = r.title && r.title.toLowerCase().includes(q);
+        const goalMatch = r.goal && r.goal.toLowerCase().includes(q);
+        const summaryMatch = r.summary && r.summary.toLowerCase().includes(q);
+        if (titleMatch || goalMatch || summaryMatch) {
+          matchedRuns.push(r);
+        }
+      }
+    }
+
+    const matchedKnowledge: any[] = [];
+    for (const k of inMemoryDb.knowledgeItems.values()) {
+      if (k.orgId === orgId) {
+        const titleMatch = k.title && k.title.toLowerCase().includes(q);
+        const bodyMatch = k.bodyMd && k.bodyMd.toLowerCase().includes(q);
+        const tagMatch = k.tags && k.tags.some((t: string) => t.toLowerCase().includes(q));
+        if (titleMatch || bodyMatch || tagMatch) {
+          matchedKnowledge.push(k);
+        }
+      }
+    }
+
+    return { runs: matchedRuns, knowledgeItems: matchedKnowledge };
+  }
+
+  async getActivity(orgId: string, limit: number = 50): Promise<EventEnvelope[]> {
+    const allEvents: EventEnvelope[] = [];
+    for (const [rId, evs] of inMemoryDb.events.entries()) {
+      const run = inMemoryDb.runs.get(rId);
+      if (run && run.orgId === orgId) {
+        allEvents.push(...evs);
+      }
+    }
+
+    allEvents.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return allEvents.slice(0, limit);
+  }
+
+  getUserRole(orgId: string, userId: string): 'owner' | 'admin' | 'member' | 'viewer' {
+    const mem = inMemoryDb.memberships.get(`${orgId}:${userId}`);
+    if (mem && mem.role) return mem.role;
+    // Default fallback to member
+    return 'member';
+  }
 }

@@ -371,12 +371,60 @@ export function buildServer() {
   // PHASE 1: STEERING & CONTROLS (Section 11)
   // ==========================================
 
+  // RBAC Permission Check (Section 8: Viewers cannot steer or approve)
+  function checkNotViewer(orgId: string, userId: string, reply: any): boolean {
+    const role = repository.getUserRole(orgId, userId);
+    if (role === 'viewer') {
+      reply.code(403).send({
+        error: {
+          code: 'VIEWER_CANNOT_STEER',
+          message: 'Users with Viewer role cannot steer, pause, comment, approve, or take over runs.',
+        },
+      });
+      return false;
+    }
+    return true;
+  }
+
+  // Slack Webhook Notifier (Section 14)
+  async function notifySlack(eventType: string, payload: any) {
+    const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+    const slackMessage = {
+      text: `[AgentRoom Alert] ${eventType}: ${payload.title || payload.summary || payload.note || 'Action taken in room'}`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*AgentRoom Event:* \`${eventType}\`\n>${payload.summary || payload.note || payload.text || 'Notification from room'}`,
+          },
+        },
+      ],
+    };
+
+    if (webhookUrl) {
+      try {
+        await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(slackMessage),
+        });
+      } catch {}
+    }
+    return slackMessage;
+  }
+
   // Post Steering Message (Queue or Interrupt)
   app.post('/v1/runs/:id/messages', async (request, reply) => {
     const params = request.params as { id: string };
     const body = (request.body as { text: string; mode?: 'queue' | 'interrupt'; authorId?: string }) || {};
 
     const authorId = body.authorId || SEEDED_DATA.users[0]!.id;
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+
+    if (!checkNotViewer(orgId, authorId, reply)) return;
+
     const mode = body.mode || 'queue';
 
     const envelope = await repository.appendEvent(params.id, {
@@ -404,13 +452,18 @@ export function buildServer() {
   // Pause Run
   app.post('/v1/runs/:id/pause', async (request, reply) => {
     const params = request.params as { id: string };
-    const body = (request.body as { reason?: string }) || {};
+    const body = (request.body as { reason?: string; userId?: string }) || {};
+    const userId = body.userId || SEEDED_DATA.users[0]!.id;
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+
+    if (!checkNotViewer(orgId, userId, reply)) return;
 
     await repository.appendEvent(params.id, {
       runId: params.id,
       type: 'run.pause_requested',
       actorType: 'human',
-      actorId: SEEDED_DATA.users[0]!.id,
+      actorId: userId,
       payload: {
         reason: body.reason || 'Paused by user',
       },
@@ -442,12 +495,18 @@ export function buildServer() {
   // Resume Run
   app.post('/v1/runs/:id/resume', async (request, reply) => {
     const params = request.params as { id: string };
+    const body = (request.body as { userId?: string }) || {};
+    const userId = body.userId || SEEDED_DATA.users[0]!.id;
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+
+    if (!checkNotViewer(orgId, userId, reply)) return;
 
     await repository.appendEvent(params.id, {
       runId: params.id,
       type: 'run.resumed',
       actorType: 'human',
-      actorId: SEEDED_DATA.users[0]!.id,
+      actorId: userId,
       payload: {},
     });
 
@@ -469,7 +528,12 @@ export function buildServer() {
   // Approval Decision (Approve or Deny)
   app.post('/v1/runs/:id/approvals/:approvalId', async (request, reply) => {
     const params = request.params as { id: string; approvalId: string };
-    const body = (request.body as { decision: 'approved' | 'denied'; note?: string }) || { decision: 'approved' };
+    const body = (request.body as { decision: 'approved' | 'denied'; note?: string; userId?: string }) || { decision: 'approved' };
+    const userId = body.userId || SEEDED_DATA.users[0]!.id;
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+
+    if (!checkNotViewer(orgId, userId, reply)) return;
 
     await globalPubSub.publish(
       `run:${params.id}:control`,
@@ -489,6 +553,10 @@ export function buildServer() {
     const params = request.params as { id: string };
     const body = (request.body as { userId?: string }) || {};
     const userId = body.userId || SEEDED_DATA.users[0]!.id;
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+
+    if (!checkNotViewer(orgId, userId, reply)) return;
 
     await repository.appendEvent(params.id, {
       runId: params.id,
@@ -739,6 +807,92 @@ export function buildServer() {
     const atSeq = body.atSeq ?? run.lastSeq ?? 0;
     const forkedRun = await repository.forkRun(params.id, atSeq, body.editedMessage, body.userId);
     return { run: forkedRun };
+  });
+
+  // ==========================================
+  // PHASE 4: STEP COMMENTS (Section 13)
+  // ==========================================
+  app.get('/v1/runs/:id/comments', async (request, reply) => {
+    const params = request.params as { id: string };
+    const comments = await repository.getComments(params.id);
+    return { comments };
+  });
+
+  app.post('/v1/runs/:id/comments', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = request.body as {
+      targetSeq: number;
+      body: string;
+      directsAgent?: boolean;
+      authorId?: string;
+    };
+
+    const authorId = body.authorId || SEEDED_DATA.users[0]!.id;
+    const run = await repository.getRun(params.id);
+    const orgId = run?.orgId || SEEDED_DATA.org.id;
+
+    if (!checkNotViewer(orgId, authorId, reply)) return;
+
+    const res = await repository.addComment(params.id, {
+      targetSeq: body.targetSeq,
+      authorId,
+      body: body.body,
+      directsAgent: body.directsAgent,
+    });
+
+    return res;
+  });
+
+  app.post('/v1/comments/:id/resolve', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = (request.body as { runId: string; userId?: string }) || { runId: '' };
+    const res = await repository.resolveComment(
+      params.id,
+      body.runId,
+      body.userId || SEEDED_DATA.users[0]!.id
+    );
+    return res;
+  });
+
+  // ==========================================
+  // PHASE 4: SUMMARIZATION & KNOWLEDGE (Section 14)
+  // ==========================================
+  app.post('/v1/runs/:id/summarize', async (request, reply) => {
+    const params = request.params as { id: string };
+    const body = (request.body as {
+      summary: string;
+      title?: string;
+      tags?: string[];
+      userId?: string;
+    }) || { summary: 'Task completed successfully' };
+
+    const res = await repository.summarizeRun(params.id, body);
+    await notifySlack('run.summarized', { summary: body.summary, title: body.title });
+    return res;
+  });
+
+  app.get('/v1/knowledge-items', async (request, reply) => {
+    const query = (request.query as { orgId?: string; projectId?: string }) || {};
+    const orgId = query.orgId || SEEDED_DATA.org.id;
+    const items = await repository.listKnowledgeItems(orgId, query.projectId);
+    return { items };
+  });
+
+  // ==========================================
+  // PHASE 4: GLOBAL SEARCH & ACTIVITY FEED
+  // ==========================================
+  app.get('/v1/search', async (request, reply) => {
+    const query = (request.query as { q?: string; orgId?: string }) || {};
+    const orgId = query.orgId || SEEDED_DATA.org.id;
+    const results = await repository.search(orgId, query.q || '');
+    return results;
+  });
+
+  app.get('/v1/activity', async (request, reply) => {
+    const query = (request.query as { orgId?: string; limit?: string }) || {};
+    const orgId = query.orgId || SEEDED_DATA.org.id;
+    const events = await repository.getActivity(orgId, Number(query.limit || 50));
+    return { events };
   });
 
   // Trigger Simulation / Execution

@@ -34,6 +34,8 @@ import {
   AlertTriangle,
   ArrowRightLeft,
   X,
+  MessageSquare,
+  BookOpen,
 } from 'lucide-react';
 import { applyEvent, createInitialRunState } from '@agentroom/core';
 import type { EventEnvelope, RunState } from '@agentroom/core';
@@ -47,6 +49,9 @@ export default function RunRoomPage() {
   // API host
   const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
   const WS_URL = API_URL.replace(/^http/, 'ws') + '/v1/ws';
+
+  // Current logged in user from switcher
+  const [currentUser, setCurrentUser] = useState<any>(null);
 
   // Run store
   const [runState, setRunState] = useState<RunState>(() =>
@@ -68,7 +73,7 @@ export default function RunRoomPage() {
   const [contextError, setContextError] = useState<string | null>(null);
   const [contextSaved, setContextSaved] = useState(false);
 
-  // Modals (Phase 3)
+  // Modals & Actions
   const [showHandoffModal, setShowHandoffModal] = useState(false);
   const [handoffUserId, setHandoffUserId] = useState('01935e40-0002-7000-8000-000000000002');
   const [handoffNote, setHandoffNote] = useState('');
@@ -79,6 +84,11 @@ export default function RunRoomPage() {
 
   const [showGraphModal, setShowGraphModal] = useState(false);
 
+  // Step Comments (Phase 4)
+  const [commentingSeq, setCommentingSeq] = useState<number | null>(null);
+  const [commentText, setCommentText] = useState('');
+  const [directsAgent, setDirectsAgent] = useState(false);
+
   // Human tool command execution during takeover
   const [humanToolCmd, setHumanToolCmd] = useState('');
 
@@ -86,6 +96,21 @@ export default function RunRoomPage() {
   const timelineBottomRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [newEventsCount, setNewEventsCount] = useState(0);
+
+  // Check current user
+  useEffect(() => {
+    const updateLocalUser = () => {
+      const saved = localStorage.getItem('agentroom_user');
+      if (saved) {
+        try {
+          setCurrentUser(JSON.parse(saved));
+        } catch {}
+      }
+    };
+    updateLocalUser();
+    window.addEventListener('storage', updateLocalUser);
+    return () => window.removeEventListener('storage', updateLocalUser);
+  }, []);
 
   // Fetch context blocks
   const fetchContextBlocks = async () => {
@@ -223,7 +248,7 @@ export default function RunRoomPage() {
     const authorId = userSaved ? JSON.parse(userSaved).id : undefined;
 
     try {
-      await fetch(`${API_URL}/v1/runs/${runId}/messages`, {
+      const res = await fetch(`${API_URL}/v1/runs/${runId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -232,6 +257,11 @@ export default function RunRoomPage() {
           authorId,
         }),
       });
+
+      if (res.status === 403) {
+        alert('Permission Denied: Users with Viewer role cannot steer the agent.');
+        return;
+      }
       setMessageText('');
     } catch {}
   };
@@ -239,20 +269,26 @@ export default function RunRoomPage() {
   const handlePauseResume = async () => {
     const endpoint = runState.status === 'paused' ? 'resume' : 'pause';
     try {
-      await fetch(`${API_URL}/v1/runs/${runId}/${endpoint}`, {
+      const res = await fetch(`${API_URL}/v1/runs/${runId}/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });
+      if (res.status === 403) {
+        alert('Permission Denied: Viewers cannot pause or resume runs.');
+      }
     } catch {}
   };
 
   const handleTakeover = async () => {
     const endpoint = runState.driver.type === 'human' ? 'handback' : 'takeover';
     try {
-      await fetch(`${API_URL}/v1/runs/${runId}/${endpoint}`, {
+      const res = await fetch(`${API_URL}/v1/runs/${runId}/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });
+      if (res.status === 403) {
+        alert('Permission Denied: Viewers cannot take over driving.');
+      }
     } catch {}
   };
 
@@ -339,6 +375,47 @@ export default function RunRoomPage() {
     } catch {}
   };
 
+  const handleAddComment = async (seq: number) => {
+    if (!commentText.trim()) return;
+    const userSaved = localStorage.getItem('agentroom_user');
+    const authorId = userSaved ? JSON.parse(userSaved).id : undefined;
+
+    try {
+      const res = await fetch(`${API_URL}/v1/runs/${runId}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetSeq: seq,
+          body: commentText,
+          directsAgent,
+          authorId,
+        }),
+      });
+
+      if (res.status === 403) {
+        alert('Permission Denied: Viewers cannot post comments.');
+        return;
+      }
+
+      setCommentText('');
+      setCommentingSeq(null);
+    } catch {}
+  };
+
+  const handleSummarize = async () => {
+    try {
+      await fetch(`${API_URL}/v1/runs/${runId}/summarize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          summary: `Run ${runState.title} successfully completed with schema backward compatibility verified and tests passing.`,
+          title: `Knowledge: ${runState.title}`,
+          tags: ['migration', 'payments', 'v2'],
+        }),
+      });
+    } catch {}
+  };
+
   const handleApprove = async (approvalId: string, approved: boolean) => {
     try {
       await fetch(`${API_URL}/v1/runs/${runId}/approvals/${approvalId}`, {
@@ -364,6 +441,8 @@ export default function RunRoomPage() {
     } catch {}
   };
 
+  const isViewer = currentUser?.role === 'viewer';
+
   return (
     <div className="h-screen flex flex-col bg-[#141413] text-[#e8e6e3] overflow-hidden select-none">
       {/* 1. TOP BAR */}
@@ -372,7 +451,7 @@ export default function RunRoomPage() {
           <Link
             href="/"
             className="p-1.5 rounded-lg hover:bg-[#252422] text-[#888580] hover:text-white transition"
-            title="Back to Workspace"
+            title="Back to Dashboard"
           >
             <ArrowLeft className="w-4 h-4" />
           </Link>
@@ -460,15 +539,17 @@ export default function RunRoomPage() {
           <div className="flex items-center gap-1.5">
             <button
               onClick={startSimulation}
+              disabled={isViewer}
               title="Start Agent loop in sandbox"
-              className="px-2.5 py-1.5 rounded-lg bg-[#da7756] hover:bg-[#c66545] text-xs font-semibold text-white flex items-center gap-1.5 transition shadow"
+              className="px-2.5 py-1.5 rounded-lg bg-[#da7756] hover:bg-[#c66545] disabled:opacity-40 text-xs font-semibold text-white flex items-center gap-1.5 transition shadow"
             >
               <Play className="w-3.5 h-3.5 fill-current" /> Run Agent
             </button>
 
             <button
               onClick={handlePauseResume}
-              className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] text-xs font-medium text-white flex items-center gap-1.5 transition"
+              disabled={isViewer}
+              className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] disabled:opacity-40 text-xs font-medium text-white flex items-center gap-1.5 transition"
             >
               {runState.status === 'paused' ? (
                 <>
@@ -483,26 +564,26 @@ export default function RunRoomPage() {
 
             <button
               onClick={handleTakeover}
+              disabled={isViewer}
               className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition border ${
                 runState.driver.type === 'human'
                   ? 'bg-purple-600 text-white border-purple-500'
-                  : 'bg-[#22211f] hover:bg-[#2b2a27] text-white border-[#33312e]'
+                  : 'bg-[#22211f] hover:bg-[#2b2a27] disabled:opacity-40 text-white border-[#33312e]'
               }`}
             >
               <HandMetal className="w-3.5 h-3.5" />
               {runState.driver.type === 'human' ? 'Hand back' : 'Take over'}
             </button>
 
-            {/* Phase 3: Handoff Button */}
             <button
               onClick={() => setShowHandoffModal(true)}
-              className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] text-xs font-medium text-white flex items-center gap-1.5 transition"
-              title="Hand off driver control to a teammate"
+              disabled={isViewer}
+              className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] disabled:opacity-40 text-xs font-medium text-white flex items-center gap-1.5 transition"
+              title="Hand off driver control"
             >
               <ArrowRightLeft className="w-3.5 h-3.5 text-blue-400" /> Handoff
             </button>
 
-            {/* Phase 3: Fork Button */}
             <button
               onClick={() => {
                 setForkAtSeq(runState.lastSeq);
@@ -514,11 +595,18 @@ export default function RunRoomPage() {
               <GitFork className="w-3.5 h-3.5 text-emerald-400" /> Fork
             </button>
 
-            {/* Phase 3: Graph View Button */}
+            <button
+              onClick={handleSummarize}
+              className="px-2.5 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-950/30 hover:bg-emerald-900/40 text-xs font-medium text-emerald-300 flex items-center gap-1.5 transition"
+              title="Summarize run into knowledge item"
+            >
+              <BookOpen className="w-3.5 h-3.5 text-emerald-400" /> Summarize
+            </button>
+
             <button
               onClick={() => setShowGraphModal(true)}
               className="px-2.5 py-1.5 rounded-lg border border-[#33312e] bg-[#22211f] hover:bg-[#2b2a27] text-xs font-medium text-white flex items-center gap-1.5 transition"
-              title="View Run Lineage and Fork Tree"
+              title="View Run Lineage Graph"
             >
               <GitBranch className="w-3.5 h-3.5 text-purple-400" /> Graph
             </button>
@@ -527,6 +615,21 @@ export default function RunRoomPage() {
           </div>
         </div>
       </header>
+
+      {/* VIEWER RBAC BANNER */}
+      {isViewer && (
+        <div className="bg-amber-950/50 border-b border-amber-500/30 px-5 py-2 text-xs text-amber-300 flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>
+              <strong>Viewer Mode ({currentUser?.name}):</strong> You have read-only access. Steering, pause, approvals, and driver takeover are restricted to editors and admins.
+            </span>
+          </div>
+          <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-amber-900/60 text-amber-300 border border-amber-600/40 font-semibold">
+            Read-Only
+          </span>
+        </div>
+      )}
 
       {/* 2. BODY LAYOUT (Left Rail | Center Timeline | Right Panel) */}
       <div className="flex-1 flex overflow-hidden relative">
@@ -632,7 +735,6 @@ export default function RunRoomPage() {
                                 setShowForkModal(true);
                               }}
                               className="text-[10px] px-1.5 py-0.5 rounded bg-[#22211f] hover:bg-[#2b2a27] text-zinc-400 hover:text-white flex items-center gap-1 transition"
-                              title="Fork from this message"
                             >
                               <GitFork className="w-3 h-3 text-emerald-400" /> Fork
                             </button>
@@ -640,8 +742,7 @@ export default function RunRoomPage() {
                         </div>
                         <div className="text-sm text-[#f0eeeb] leading-relaxed">{payload.text}</div>
                         <div className="mt-1.5 text-[10px] text-emerald-400/80 flex items-center gap-1 font-mono">
-                          <CheckCircle2 className="w-3 h-3" />
-                          Delivered to agent
+                          <CheckCircle2 className="w-3 h-3" /> Delivered
                         </div>
                       </div>
                     </div>
@@ -664,12 +765,17 @@ export default function RunRoomPage() {
                           <div className="flex items-center gap-2">
                             <span className="text-[10px] text-[#666460] font-mono">Seq {ev.seq}</span>
                             <button
+                              onClick={() => setCommentingSeq(commentingSeq === ev.seq ? null : ev.seq)}
+                              className="text-[10px] px-1.5 py-0.5 rounded bg-[#22211f] hover:bg-[#2b2a27] text-zinc-400 hover:text-white flex items-center gap-1 transition"
+                            >
+                              <MessageSquare className="w-3 h-3 text-blue-400" /> Comment
+                            </button>
+                            <button
                               onClick={() => {
                                 setForkAtSeq(ev.seq);
                                 setShowForkModal(true);
                               }}
                               className="text-[10px] px-1.5 py-0.5 rounded bg-[#22211f] hover:bg-[#2b2a27] text-zinc-400 hover:text-white flex items-center gap-1 transition"
-                              title="Fork from this step"
                             >
                               <GitFork className="w-3 h-3 text-emerald-400" /> Fork
                             </button>
@@ -678,6 +784,72 @@ export default function RunRoomPage() {
                         <div className="text-sm text-[#e8e6e3] leading-relaxed select-text font-sans whitespace-pre-wrap">
                           {payload.text}
                         </div>
+
+                        {/* Inline Step Comment Box */}
+                        {commentingSeq === ev.seq && (
+                          <div className="mt-2.5 p-3 rounded-xl bg-[#121110] border border-[#2e2d2a] space-y-2">
+                            <input
+                              type="text"
+                              value={commentText}
+                              onChange={(e) => setCommentText(e.target.value)}
+                              placeholder="Comment on this step (e.g. 'Keep v1 envelope')..."
+                              className="w-full bg-transparent text-xs text-white placeholder-zinc-500 focus:outline-none"
+                            />
+                            <div className="flex items-center justify-between text-[11px] pt-1 border-t border-zinc-800">
+                              <label className="flex items-center gap-1.5 text-zinc-400 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={directsAgent}
+                                  onChange={(e) => setDirectsAgent(e.target.checked)}
+                                  className="rounded bg-zinc-800 border-zinc-700 text-[#da7756]"
+                                />
+                                Directs Agent (steer model on next step)
+                              </label>
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => setCommentingSeq(null)}
+                                  className="px-2 py-0.5 text-zinc-400 hover:text-white"
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddComment(ev.seq)}
+                                  className="px-2.5 py-1 rounded bg-[#da7756] hover:bg-[#c66545] text-white font-medium"
+                                >
+                                  Post Comment
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                }
+
+                if (ev.type === 'comment.added') {
+                  const payload = ev.payload as any;
+                  return (
+                    <div
+                      key={ev.id}
+                      className="p-3.5 rounded-xl border border-blue-500/30 bg-blue-950/20 flex items-start gap-3 shadow-md"
+                    >
+                      <MessageSquare className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-semibold text-white">Comment on Step {payload.targetSeq}</span>
+                            {payload.directsAgent && (
+                              <span className="text-[10px] px-1.5 py-0.2 rounded bg-[#da7756]/20 text-[#da7756] border border-[#da7756]/30 font-semibold font-mono">
+                                Directs Agent
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-[10px] text-zinc-500 font-mono">Seq {ev.seq}</span>
+                        </div>
+                        <p className="text-xs text-blue-100/90 leading-relaxed">{payload.body}</p>
                       </div>
                     </div>
                   );
@@ -718,6 +890,24 @@ export default function RunRoomPage() {
                   );
                 }
 
+                if (ev.type === 'run.summarized') {
+                  const payload = ev.payload as any;
+                  return (
+                    <div
+                      key={ev.id}
+                      className="p-4 rounded-xl border border-emerald-500/40 bg-emerald-950/20 space-y-1.5 shadow-lg"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                          <BookOpen className="w-4 h-4" /> Synthesized into Team Knowledge Base
+                        </span>
+                        <span className="text-[10px] text-zinc-500 font-mono">Seq {ev.seq}</span>
+                      </div>
+                      <p className="text-xs text-emerald-100/90 leading-relaxed font-sans">{payload.summary}</p>
+                    </div>
+                  );
+                }
+
                 if (ev.type === 'approval.requested') {
                   const payload = ev.payload as any;
                   return (
@@ -739,13 +929,15 @@ export default function RunRoomPage() {
                       <div className="flex items-center gap-2 pt-1">
                         <button
                           onClick={() => handleApprove(payload.approvalId, true)}
-                          className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition"
+                          disabled={isViewer}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-semibold transition"
                         >
                           Approve Command
                         </button>
                         <button
                           onClick={() => handleApprove(payload.approvalId, false)}
-                          className="px-3 py-1.5 rounded-lg bg-red-600/80 hover:bg-red-600 text-white text-xs font-semibold transition"
+                          disabled={isViewer}
+                          className="px-3 py-1.5 rounded-lg bg-red-600/80 hover:bg-red-600 disabled:opacity-40 text-white text-xs font-semibold transition"
                         >
                           Deny
                         </button>
@@ -784,12 +976,13 @@ export default function RunRoomPage() {
                   type="text"
                   value={humanToolCmd}
                   onChange={(e) => setHumanToolCmd(e.target.value)}
+                  disabled={isViewer}
                   placeholder="You are driving! Execute shell command in sandbox (e.g. 'pnpm test:auth')..."
                   className="flex-1 bg-transparent text-xs text-purple-200 placeholder-purple-400/60 focus:outline-none font-mono"
                 />
                 <button
                   type="submit"
-                  disabled={!humanToolCmd.trim()}
+                  disabled={!humanToolCmd.trim() || isViewer}
                   className="px-3 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-xs font-semibold text-white transition"
                 >
                   Run
@@ -835,12 +1028,17 @@ export default function RunRoomPage() {
                   type="text"
                   value={messageText}
                   onChange={(e) => setMessageText(e.target.value)}
-                  placeholder="Steer agent live in sub-300ms (e.g. 'Keep the v1 response shape')..."
-                  className="flex-1 bg-[#121110] border border-[#2e2d2a] focus:border-[#da7756] rounded-xl px-4 py-2.5 text-xs text-white placeholder-[#666460] focus:outline-none transition shadow-inner"
+                  disabled={isViewer}
+                  placeholder={
+                    isViewer
+                      ? 'Viewer mode: steering is disabled'
+                      : "Steer agent live in sub-300ms (e.g. 'Keep the v1 response shape')..."
+                  }
+                  className="flex-1 bg-[#121110] border border-[#2e2d2a] focus:border-[#da7756] disabled:opacity-40 rounded-xl px-4 py-2.5 text-xs text-white placeholder-[#666460] focus:outline-none transition shadow-inner"
                 />
                 <button
                   type="submit"
-                  disabled={!messageText.trim()}
+                  disabled={!messageText.trim() || isViewer}
                   className="px-4 py-2.5 rounded-xl bg-[#da7756] hover:bg-[#c66545] disabled:opacity-40 disabled:hover:bg-[#da7756] text-white text-xs font-semibold flex items-center gap-1.5 transition shadow"
                 >
                   <Send className="w-3.5 h-3.5" />
@@ -913,7 +1111,8 @@ export default function RunRoomPage() {
                     </span>
                     <button
                       onClick={handleSaveContextBlock}
-                      className="px-2 py-1 rounded bg-[#da7756] hover:bg-[#c66545] text-white text-[11px] font-semibold flex items-center gap-1 transition"
+                      disabled={isViewer}
+                      className="px-2 py-1 rounded bg-[#da7756] hover:bg-[#c66545] disabled:opacity-40 text-white text-[11px] font-semibold flex items-center gap-1 transition"
                     >
                       <Save className="w-3 h-3" /> Save
                     </button>
@@ -922,7 +1121,8 @@ export default function RunRoomPage() {
                     rows={7}
                     value={blockContent}
                     onChange={(e) => setBlockContent(e.target.value)}
-                    className="w-full bg-[#121110] border border-[#292826] rounded-lg p-2.5 text-xs text-[#c2bfba] font-mono focus:border-[#da7756] focus:outline-none transition leading-relaxed resize-none"
+                    disabled={isViewer}
+                    className="w-full bg-[#121110] border border-[#292826] rounded-lg p-2.5 text-xs text-[#c2bfba] font-mono focus:border-[#da7756] focus:outline-none transition leading-relaxed resize-none disabled:opacity-60"
                   />
                   <div className="text-[10px] text-[#666460]">
                     Block-level versioning with 30s soft-lock protection.

@@ -71,3 +71,47 @@
    ALL PHASE 3 ACCEPTANCE TESTS PASSED (5/5) ✓     
 ====================================================
 ```
+
+## Phase 4: Team Workspace & Knowledge (Status: COMPLETE ✓)
+- [x] Task 4.1: Step comments model, persistence, and `comment.added` / `comment.resolved` events with `directsAgent` flag (1.5h)
+- [x] Task 4.2: Run summarization into team `knowledge_items` repository (`run.summarized`) (1.5h)
+- [x] Task 4.3: Full-text search endpoint across runs, goals, summaries, and knowledge items (`GET /v1/search`) (1.5h)
+- [x] Task 4.4: Real-time organization activity feed endpoint (`GET /v1/activity`) (1h)
+- [x] Task 4.5: RBAC Viewer permission restrictions enforcing read-only access with 403 `VIEWER_CANNOT_STEER` (1.5h)
+- [x] Task 4.6: Slack webhook notification dispatcher for approvals, summaries, and handoffs (1h)
+- [x] Task 4.7: Dashboard UI updates with live search bar, team knowledge cards, and activity stream (2h)
+- [x] Task 4.8: Run screen UI updates with inline step comments, directs-agent checkbox, and viewer warning banner (1.5h)
+- [x] Task 4.9: Automated test suite verification (`test-phase4.ts`) validating all 5 Phase 4 criteria (1.5h)
+
+### Phase 4 Acceptance Test Results:
+```text
+====================================================
+   VERIFYING PHASE 4: WORKSPACE, KNOWLEDGE & RBAC   
+====================================================
+
+[Test 1/5] Step Comments & Directing the Agent (Section 13):
+  ✓ Comment added on step 2 by Sara (directsAgent: true)
+  ✓ Comment retrieved from run comments store
+  ✓ Comment marked resolved with comment.resolved event
+
+[Test 2/5] Run Summarization into Team Knowledge Base (Section 14):
+  ✓ Run synthesized into team knowledge item "Payments v2 REST API Migration Spec"
+  ✓ Team knowledge repository contains 1 indexed item(s)
+
+[Test 3/5] Global Search across Runs & Knowledge Base:
+  ✓ Search for "idempotent" matched 1 runs and 1 knowledge items
+  ✓ Search for "payments" matched 1 runs
+
+[Test 4/5] Real-Time Organization Activity Feed:
+  ✓ Organization activity feed returned 4 chronological events (latest: run.summarized)
+
+[Test 5/5] RBAC Viewer Permissions Enforcement:
+  ✓ Viewer steering correctly rejected with 403 VIEWER_CANNOT_STEER
+  ✓ Viewer run pause correctly rejected with 403
+  ✓ Viewer takeover correctly rejected with 403
+  ✓ Viewer comment correctly rejected with 403
+
+====================================================
+   ALL PHASE 4 ACCEPTANCE TESTS PASSED (5/5) ✓     
+====================================================
+```

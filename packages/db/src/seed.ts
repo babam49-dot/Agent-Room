@@ -34,6 +34,14 @@ export const SEEDED_DATA = {
       role: 'member' as const,
       avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=128&h=128&fit=crop',
     },
+    {
+      id: '01935e40-0002-7000-8000-000000000004',
+      externalId: 'user_tom',
+      name: 'Tom Reader',
+      email: 'tom@acme.corp',
+      role: 'viewer' as const,
+      avatarUrl: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=128&h=128&fit=crop',
+    },
   ],
   project: {
     id: '01935e40-0003-7000-8000-000000000001',
